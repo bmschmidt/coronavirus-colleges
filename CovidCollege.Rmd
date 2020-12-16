@@ -1,0 +1,469 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+This is supporting code for an article for the Chronicle about coronavirus on college campuses.
+
+I have not attempted to explain everything, but the code should run. You will need to acquire a (publically available) key from the census bureau to run their portions. Coronavirus statistics are from Johns Hopkins, and the code here will always use the most recent version on their github repo.
+
+```{r}
+library(tidycensus)
+library(tidyverse)
+library(sf)
+
+options(tigris_use_cache = TRUE)
+```
+
+```{r, cache=TRUE}
+v18 <- load_variables(2018, "acs5", cache = TRUE)
+
+# How you find variables.
+silent = v18 %>% filter(concept == "SCHOOL ENROLLMENT BY LEVEL OF SCHOOL FOR THE POPULATION 3 YEARS AND OVER") %>% filter(
+  concept %>% str_length() < 95)
+
+v18 %>% filter(label %>% str_detect("65 years and over"))%>% filter(
+  concept %>% str_length() < 45)
+```
+
+Compile census data for high school, college, grad school, and total pops.
+
+```{r getACS, cache = TRUE}
+# high school, college, grad school, total, over 65.
+cats = c("B14001_007", "B14001_008", "B14001_009", "B01001_001", "C18130_016")
+
+g = get_acs("county", cats, geometry = FALSE, cache_table = TRUE)
+# ?get_acs
+
+shares = g %>% select(-moe) %>% 
+  pivot_wider(names_from = "variable", values_from="estimate") %>% 
+  mutate(share = (B14001_008 + B14001_009) / B01001_001) %>%
+  mutate(elderly_share = C18130_016/ B01001_001) %>%
+  mutate(students = B14001_008 + B14001_009, undergrads = B14001_008) %>%
+  select(NAME, FIPS = GEOID, share, elderly_share, students, undergrads, total = B01001_001) %>%
+  mutate(category = ifelse(share > .1, "student county", "non-student county") )
+
+# ?tigris::counties
+c = tigris::counties(resolution = "20m")
+dat = g %>%
+ select(-moe) %>%   pivot_wider(names_from = "variable", values_from="estimate") %>% 
+ mutate(share = (B14001_008 + B14001_009) / B01001_001, total = B01001_001) #%>%
+  #filter(share > .1)
+
+simplified = c %>% st_transform(crs = 2163) %>% st_simplify(dTolerance = 500) %>%
+    mutate(lat = as.numeric(INTPTLAT), long = as.numeric(INTPTLON))
+
+
+just_college = simplified %>% left_join(dat, by = "GEOID")# %>% filter(STATEFP < 60, STATEFP != "15", STATEFP != "02") # %>%  ggplot() + geom_sf()
+
+# Map of the College counties
+just_college %>% ggplot() + #geom_sf(lwd = .01) +
+  geom_sf(data = just_college %>% filter(share < .1) %>% st_centroid(), aes(size = total), pch = 1, alpha = .1) + 
+  geom_sf(data = just_college %>% filter(share > .1) %>% st_centroid(), aes(size = total), pch = 16) +
+  labs(title = "Map of the Times' College counties.")  
+
+
+just_college %>% 
+  st_set_geometry(NULL) %>%
+  filter(share >= .1) %>% 
+  select(name = NAME.x, FIPS = GEOID, population = total, lat, long) %>%
+  write_csv("csvs/203_counties.csv")
+
+
+```
+
+
+```{r getHopkins, cache=TRUE}
+#wider = g %>% 
+#  distinct(GEOID) %>%
+#  inner_join(shares) %>%
+#  ggplot() + geom_sf(aes(fill=B14001_001))
+
+# wider + scale_fill_viridis_c(trans="log")
+
+shares %>%
+  arrange(-total) %>%
+  mutate(r = 1:n(), cumulative = cumsum(total))%>%
+  ggplot() + geom_line(aes(x=r, y = cumulative))
+  
+shares %>% write_csv("ACS.csv")
+
+
+cases_raw = read_csv('https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_US.csv')
+deaths_raw = read_csv('https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_US.csv')
+
+deparse = . %>%  mutate(FIPS = str_pad(FIPS, 5, "left", "0")) %>% 
+  pivot_longer(cols = matches("[0-9]/"), names_to = "date", values_to = "count") %>% 
+  mutate(date = lubridate::parse_date_time(date, orders = "m/d/y")) %>% mutate(new = count - lag(count, 1))
+
+cases = cases_raw %>% deparse %>% mutate(variable = "cases")
+deaths = deaths_raw %>% deparse  %>% mutate(variable = "deaths")
+
+
+together = cases %>% bind_rows(deaths) %>% inner_join(shares)
+
+together %>% filter(variable=="deaths") %>% filter(new > 0) %>%
+  group_by(category, date, variable) %>% summarize(count = sum(new)/sum(total)) %>%
+  ggplot() + geom_line(aes(x = date, y = count, color=category)) + labs(title = "Death Rate from COVID-19 by student population") + scale_color_brewer(palette = 2, type="qual") + theme_bw() + facet_wrap(~variable, scales = "free_y") + labs(caption = "Johns Hopkins data")
+
+```
+
+To make plots pretty, we'll start the weeks so that using the last data in the set produces 
+a seven-day week
+
+```{r}
+last_date = max(together$date)
+
+dow = lubridate::wday(last_date)
+if (dow == 7) {dow = 0}
+
+weekly = together %>% filter(date > lubridate::ymd("2020-03-15"))  %>% mutate(week = lubridate::floor_date(date, unit = "week", week_start = (dow + 1))) %>%
+  group_by(FIPS, variable, Combined_Key, week, students, share, elderly_share, category, total) %>% 
+  summarize(new = sum(new))
+
+weekly %>% group_by(week, variable) %>% summarize(new = sum(new)) %>%
+  ggplot() + geom_line(aes(x = week, y = new, color = variable)) +
+  labs(title = "Weekly counts. Sanity test on data.")
+```
+
+```{r}
+
+populations = weekly %>% ungroup %>% distinct(FIPS, category, total)
+
+pops = populations %>% count(category, wt = total, name = "total")
+
+data1 = weekly %>% 
+  group_by(category, week, variable) %>%
+  summarize(count = sum(new)) %>% 
+  inner_join(pops) %>%
+  mutate(rate = count/total) %>%
+  select(week, rate, category, variable)
+
+
+data1 %>%
+  ggplot() + geom_line(aes(x = week, y = rate, color = category)) + 
+  facet_wrap(~variable, scales = "free_y") + labs(title = "Coronavirus cases in 
+                                                  college counties briefly exceeded nationwide 
+                                                  averages, while deaths have been in line
+                                                  with nationwide averages since October" %>% str_wrap(75))
+data1 %>% write_csv("csvs/fig1-national-rates-in-college-and-non-college.csv")
+```
+
+```{r}
+overall_rates = weekly %>%
+  group_by(variable, total) %>%
+  summarize(total = sum(total))
+
+```
+
+A reproduction of the Times chart from Hopkins data. There are some mild differences--I fear Utah
+county in particular is a mess-but the shape is close enough that it would pass in a bad
+quantitative discipline like Psychology. (I hope you read you my supporting materials, Psychology friends! Just kidding. I don't have any psychologist friends. And psychologists probably can't read, anyway.)
+
+```{r}
+
+times_repro = weekly %>% ungroup %>%
+  group_by(week, total, variable, FIPS, category) %>% 
+  summarize(new = sum(new)) %>%
+  group_by(week, variable, category) %>%
+  summarize(total = sum(total), new = sum(new)) %>%
+  mutate(ratio = new/total) %>% 
+  select(-new, -total) %>%
+  pivot_wider(names_from = "category", values_from = "ratio") %>%
+  mutate(relative_rate = `student county`/`non-student county`) %>%
+      select(week, relative_rate, variable)
+
+times_repro %>% write_csv("csvs/times_reproduction_data.csv")
+  
+  
+times_repro %>%  ggplot() + geom_line(aes(x = week, y = relative_rate, color = variable)) + 
+     theme_bw() + labs(title = "Student county rates as share of non-student-county rates.")
+
+
+```
+
+
+```{r}
+
+shares %>%
+  mutate(state_code = FIPS %>% str_sub(1, 2)) %>%
+  left_join(fips_codes)  %>% group_by(state) %>% arrange(-share) %>% 
+  slice(1) %>% ungroup %>%
+  arrange(share)
+
+```
+
+Not for the article--a list of states by share in college counties.
+
+```{r}
+
+
+data(fips_codes)
+
+shares %>% mutate(state_code = FIPS %>% str_sub(1, 2)) %>%
+  left_join(fips_codes) %>%
+  distinct(category, state_name, total, NAME) %>%
+  group_by(state_name) %>% 
+  mutate(state_total = sum(total)) %>%
+  filter(category == "student county") %>%
+  group_by(state_name) %>%
+  filter(state_name != "District of Columbia") %>%
+  summarize(share = sum(total)/state_total[1]) %>%
+  right_join(fips_codes) %>%
+  ggplot() + geom_col(aes(x = state_name, y = share)) + coord_flip()
+
+```
+
+
+I now know the names of some North Dakota counties. If you'd asked me before this to name a single ND county, I would have said "Oglala Lakota". Which it turns out is in South Dakota. And I only know about because it changed its name since the last census, messing up all sorts of joins.
+
+I could have named the cities, though. And I can name even more! Spearfish! Damnit, turns out that's in SD too.
+
+```{r}
+
+shares %>% filter(NAME %>% str_detect("North Dakota")) %>% arrange(-share) %>% filter(total > 50000)
+
+```
+
+Small scale comparisons. Not for article.
+```{r}
+
+compare_plot = function(fips) {
+weekly %>% filter(FIPS %in% fips)%>% group_by(FIPS)  %>%
+  ggplot() + geom_line(aes(x = week, y = new, color=Combined_Key)) +
+  facet_wrap(~variable, scales = "free_y")                         
+  
+}
+
+compare_plot(c("38035", "38015", "38101"))
+library(lubridate)
+weekly %>% ungroup %>% filter(FIPS %in% c("38035", "38015", "38101"), week >= lubridate::ymd("2020-09-15")) %>% group_by(Combined_Key, variable) %>% summarize(count = sum(new))
+```
+
+```{r}
+
+library(lubridate)
+weekly %>% ungroup %>% filter(week < ymd("2020-08-30")) %>% group_by(FIPS) %>%
+  filter(variable=="deaths") %>% summarize(deaths = sum(new)) %>% inner_join(populations)
+
+```
+
+Pairing comparable counties is kind of hard, actually, because especially in smaller states there's competition. I allow each non-college county to be matched only once, and then find the next-closest county out of those remaining. In my original Twitter thread I took just the next-smallest county; but sometimes
+that was *also* a college county. So here I take a more complicated method. It could be improved upon 
+by using demographics, population density, or simply by minimizing MSE of population difference across a state rather than handling each county separately. But again, if we're going to pretend psychology is a quantitative science based on asking college students questions for chocolate, surely I can get away with this crude an approximation!
+
+
+```{r make_comparable_counties}
+
+comparable_counties = shares %>% mutate(state = FIPS %>% str_sub(1, 2)) %>%
+  group_by(state) %>% arrange(total) %>% mutate(before = lag(FIPS, 1)) %>%
+  filter(share > .1) %>%
+  ungroup# %>%
+#  select(before)
+
+comparable_counties %>% select(FIPS = before) %>% inner_join(shares) %>% arrange(-share)
+
+shares %>% filter()
+
+non_college = shares %>% filter(share < .1) %>% mutate(state = FIPS %>% str_sub(1, 2))  %>% select(NAME, total, FIPS, state, share)
+
+
+# DC as part of Virginia
+
+college = shares %>% filter(share > .1) %>% mutate(state = FIPS %>% str_sub(1, 2))  %>% select(NAME, total, FIPS, state, share) %>%
+  mutate(state = ifelse(state == "11", "24", state))
+
+comparison_pairs_universe = college %>% 
+  inner_join(non_college, by = c("state")) %>%
+  mutate(difference = abs(total.x - total.y))
+
+just_top_pairs = .  %>%
+  group_by(FIPS.x) %>%
+  arrange(difference) %>%
+  slice(1) %>%
+  group_by(FIPS.y) %>%
+  arrange(difference) %>% slice(1)
+
+comparison_pairs = comparison_pairs_universe %>% just_top_pairs()
+
+add_missing_pairs_once = function(comparison_pairs) {
+  comparison_pairs_universe %>% 
+    anti_join(comparison_pairs, by = c("FIPS.x" = "FIPS.x")) %>%
+    anti_join(comparison_pairs, by = c("FIPS.y" = "FIPS.y")) %>%
+    just_top_pairs() %>% bind_rows(comparison_pairs)
+}
+
+i = 0
+while(comparison_pairs %>% nrow() < college %>% nrow) {
+  i = i+1
+ comparison_pairs = comparison_pairs %>%
+  add_missing_pairs_once 
+ if(i > 50) {
+   break
+ }
+}
+
+comparison_pairs %>% arrange(-total.y)
+
+non_college_equivalent = comparison_pairs %>% ungroup %>% select(NAME.y, FIPS = FIPS.y, total.y)
+non_college_equivalent  %>% arrange(-total.y)
+
+
+comparison_pairs %>% select(original = NAME.x, comparison = NAME.y, original_pop = total.x, comparison_pop = total.y, original_college_share = share.x, comparison_college_share = share.y) %>%
+  write_csv("csvs/county_pairings.csv")
+```
+
+A goofy map
+```{r}
+simpset = simplified %>% st_set_geometry(NULL) %>% select(GEOID, lat, long)
+
+comparison_pairs %>%
+  inner_join(simpset, by = c("FIPS.x" = "GEOID")) %>%
+  inner_join(simpset, by = c("FIPS.y" = "GEOID")) %>%
+  ggplot() + geom_segment(aes(x = long.x, xend = long.y, y = lat.x, yend = lat.y), arrow = arrow(length = unit(.2, "cm") )) + coord_equal() +
+  labs(title = "pairings of counties", subtitle = "This is a pretty useless chart, but at least it shows that they aren't always next to each other")
+```
+
+A plot of the comparison in Michigan. Fun fact--I didn't know how this would come out when I ran it.
+
+```{r}
+compare_plot(c("26139", "26065"))
+
+```
+
+
+```{r}
+
+get_share = . %>% ungroup %>% group_by(week, variable) %>%
+  summarize(new = sum(new), total = sum(total)) %>%
+  mutate(share = new/total) %>% select(-new, -total)
+
+nationwide = weekly %>% get_share %>% rename(nationwide_share = share)
+
+just_college = weekly %>%
+  ungroup %>%
+  filter(category == "student county") %>%
+  get_share
+
+just_comparable = weekly %>%
+  inner_join(non_college_equivalent) %>%
+  get_share
+  
+just_college %>% inner_join(nationwide) %>% ggplot() + geom_line(aes(x = week, y = share/nationwide_share, color = variable)) + labs(title = "Changes in deaths and confirmed cases in 203 college counties") + theme_bw() + scale_y_log10()
+
+
+just_comparable %>% inner_join(nationwide) %>% ggplot() + geom_line(aes(x = week, y = share/nationwide_share, color = variable)) + labs(title = "Changes in deaths and confirmed cases \nin 203 non-college counties in the same states\nw/ similar populations") + theme_bw() + scale_y_log10(limits = c(.35, 2))
+
+just_comparable
+```
+
+```{r}
+comparison_plottable = just_college %>% mutate(set = "203 counties with more than\n10% student population") %>% 
+  bind_rows(just_comparable %>% mutate(set = "203 non-college counties\nin the same states")) %>%
+  inner_join(nationwide) %>%
+  filter(week > ymd("2020-04-01")) %>%
+  mutate(relative_share = share/nationwide_share) %>%
+  select(set, relative_share, variable, week)
+  
+comparison_plottable %>% write_csv("csvs/203-county-comparisons-data.csv")
+comparison_plottable %>%
+  ggplot() + geom_line(aes(x = week, y = relative_share, color = set)) + 
+  facet_wrap(~variable) + scale_y_log10() + theme_bw() +
+  scale_color_brewer(type = "qual") + 
+  labs(title = "The Times is wrong: College virus outbreaks didn't clobber their communities",
+       subtitle = "A fair comparisohn" %>% str_wrap(100),
+       caption = "Coronavirus statistics from Johns Hopkins; Census data from the 2018 ACS.\nWashington DC treated as part of MD, and so paired to Baltimore City."
+       )
+
+controlled_comparison = 
+just_college %>% inner_join(just_comparable %>% rename(control_share = share)) %>%
+  mutate(relative_to_203_non_college_in_same_state = share/control_share)
+
+controlled_comparison %>% write_csv("csvs/controlled_comparison.csv")
+
+controlled_comparison %>% 
+  ggplot() + geom_line(aes(x=week, y=relative_to_203_non_college_in_same_state, color = variable)) + scale_y_log10() + theme_bw() + 
+  labs(title = "Compared to similarly-sized counties in the same states,\npositive tests spiked in college counties, but deaths remained low.")
+```
+
+Out of curiosity--what are the deadliest college counties? Maybe one is real bad?
+
+```{R}
+
+
+weekly %>% ungroup %>% count(week, wt=new) %>% arrange(desc(week))
+
+weekly %>%
+  ungroup %>%
+  filter(category == "student county") %>%
+  bind_rows(weekly %>% ungroup %>%
+  inner_join(non_college_equivalent)) %>%
+  filter(week > ymd("2020-08-15"), variable == "deaths") %>%
+  group_by(Combined_Key) %>%
+  summarize(deaths = sum(new), death_rate = sum(new)/total[1], share = mean(elderly_share)) %>%
+  arrange(-death_rate) %>%
+  ggplot() + geom_point() + aes(x = share, y = death_rate) + geom_smooth()
+
+```
+
+
+
+
+```{r}
+
+# Counties with low death rates before August 30.
+
+library(lubridate)
+
+weekly_ranks = weekly %>% ungroup %>% filter(week < ymd("2020-08-30")) %>% group_by(FIPS) %>%
+  filter(variable=="deaths") %>% summarize(deaths = sum(new)) %>% inner_join(populations) %>%
+  mutate(ratio = deaths/total) %>% arrange(ratio) %>%
+  mutate(death_rank_pre_september = 1:n()) %>% select(total, FIPS, category, death_rank_pre_september)
+
+weekly
+
+cat2 = weekly_ranks %>%
+  mutate(pre_sept_class = ifelse(death_rank_pre_september < 1500, "low", "high")) %>%
+  select(-death_rank_pre_september)
+
+
+weekly %>% ungroup %>%
+  left_join(cat2) %>%
+  mutate(category = pre_sept_class) %>%
+  group_by(week, total, variable, FIPS, category) %>% 
+  summarize(new = sum(new)) %>%
+  group_by(week, variable, category) %>%
+  summarize(total = sum(total), new = sum(new)) %>%
+  mutate(ratio = new/total) %>% 
+  select(-new, -total) %>%
+  pivot_wider(names_from = "category", values_from = "ratio") %>%
+  ggplot() + geom_line(aes(x = week, y = `low`/`high`, color = variable)) + 
+     theme_bw() + labs(title = "The 1500 counties with low death rates before August \ngenerally reverted back up over the mean ") + scale_y_continuous("rate relative to high-incidence counties", labels = scales::percent)
+
+
+```
+
+
+```{r}
+
+ends = weekly %>% ungroup %>% distinct(week) %>% filter(week > "2020-08-01") %>%
+  ungroup %>%
+  filter(week == first(week) | week == last(week)) %>%
+  mutate(label = c("August", "Now"))
+
+weekly %>% inner_join(ends)
+
+weekly %>%
+  ungroup %>%
+  inner_join(ends) %>%
+  select(-week) %>%
+  pivot_wider(names_from = "label", values_from = "new") %>%
+  filter(variable == "cases") %>%
+  mutate(delta = `Now`/`August`) %>%
+  filter(delta > 0, `August` > 3, `Now` > 3) %>%
+  arrange(-total) %>%
+  ggplot() + aes(x = share, y = delta) + geom_point(alpha = 0.1) + geom_text(aes(label = Combined_Key %>% str_replace(", US", "")), check_overlap = TRUE) + scale_y_continuous("Change in Coronavirus cases, Week of 8/02 to week of 12-06", trans="log10") + scale_x_continuous("Student Population share", trans="sqrt", labels = scales::percent) + geom_smooth() + theme_bw() + labs(title = "Is there a relationship between student population and corona rate?", subtitle = "Not that I can see")
+
+```
